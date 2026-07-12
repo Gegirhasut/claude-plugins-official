@@ -996,12 +996,13 @@ bot.catch(err => {
 // returned, and polling stopped permanently while the process stayed alive
 // (MCP stdin keeps it running). Outbound tools kept working but the bot was
 // deaf to inbound messages until a full restart.
+let startedAt = 0
 void (async () => {
   for (let attempt = 1; ; attempt++) {
     try {
       await bot.start({
         onStart: info => {
-          attempt = 0
+          startedAt = Date.now()
           botUsername = info.username
           process.stderr.write(`telegram channel: polling as @${info.username}\n`)
           void bot.api.setMyCommands(
@@ -1019,13 +1020,32 @@ void (async () => {
       if (shuttingDown) return
       // bot.stop() mid-setup rejects with grammy's "Aborted delay" — expected, not an error.
       if (err instanceof Error && err.message === 'Aborted delay') return
+      // bot.start() leaves its polling loop running when it rejects. Restarting
+      // without stopping stacks a second long-poll on the same token, and the
+      // two race: Telegram 409s one, the survivor acks updates the handlers
+      // never see. Whatever caused the first 409, retrying this way manufactures
+      // more of them. Always tear the old loop down before retrying.
+      await bot.stop().catch(() => {})
+
+      // Only a run that actually polled for a while earns a fresh backoff.
+      // Resetting on onStart made every 409 retry instantly (delay = 0) and put
+      // the 8-attempt bailout below permanently out of reach.
+      if (startedAt && Date.now() - startedAt > 30_000) attempt = 1
+      startedAt = 0
+
       const is409 = err instanceof GrammyError && err.error_code === 409
       if (is409 && attempt >= 8) {
         process.stderr.write(
           `telegram channel: 409 Conflict persists after ${attempt} attempts — ` +
-          `another poller is holding the bot token (stray 'bun server.ts' process or a second session). Exiting.\n`,
+          `another poller is holding the bot token (stray 'bun server.ts' process, a second session, ` +
+          `or the same token deployed on another host). Exiting.\n`,
         )
-        return
+        // `return` here only exited the retry loop. MCP stdin keeps the process alive, so the
+        // result was a live pid with zero Telegram sockets: outbound tools still worked, inbound
+        // was stone deaf, and nothing was logged ever again — a bailed-out poller is silent, so
+        // "quiet" reads as healthy. Exit for real: a dead MCP server is visible in /mcp and can
+        // be restarted; a deaf zombie holding stdin cannot be told from a working channel.
+        process.exit(1)
       }
       const delay = Math.min(1000 * attempt, 15000)
       const detail = is409
